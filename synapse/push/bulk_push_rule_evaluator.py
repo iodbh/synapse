@@ -45,7 +45,7 @@ class BulkPushRuleEvaluator:
 
     @cached(max_entries=10000)
     def _get_rules_for_room(self, room_id):
-        return RulesForRoom(self.hs, room_id)
+        return RulesForRoom(self.hs, room_id, self._get_rules_for_room.cache)
 
     @defer.inlineCallbacks
     def get_rules_for_event(self, event, context):
@@ -152,7 +152,7 @@ def _condition_checker(evaluator, conditions, uid, display_name, cache):
 
 
 class RulesForRoom(object):
-    def __init__(self, hs, room_id):
+    def __init__(self, hs, room_id, room_id_to_rules):
         self.room_id = room_id
         self.is_mine_id = hs.is_mine_id
         self.store = hs.get_datastore()
@@ -162,6 +162,13 @@ class RulesForRoom(object):
         self.state_group = object()
 
         self.sequence = 0
+
+        def invalidate_all_cb():
+            rules = room_id_to_rules.get(room_id)
+            if rules:
+                rules.invalidate_all()
+
+        self.invalidate_all_cb = invalidate_all_cb
 
     @defer.inlineCallbacks
     def get_rules(self, context):
@@ -226,7 +233,7 @@ class RulesForRoom(object):
 
         if_users_with_pushers = yield self.store.get_if_users_have_pushers(
             interested_in_user_ids,
-            on_invalidate=self.invalidate_all,
+            on_invalidate=self.invalidate_all_cb,
         )
 
         user_ids = set(
@@ -234,7 +241,7 @@ class RulesForRoom(object):
         )
 
         users_with_receipts = yield self.store.get_users_with_read_receipts_in_room(
-            self.room_id, on_invalidate=self.invalidate_all,
+            self.room_id, on_invalidate=self.invalidate_all_cb,
         )
 
         # any users with pushers must be ours: they have pushers
@@ -243,7 +250,7 @@ class RulesForRoom(object):
                 user_ids.add(uid)
 
         forgotten = yield self.store.who_forgot_in_room(
-            self.room_id, on_invalidate=self.invalidate_all,
+            self.room_id, on_invalidate=self.invalidate_all_cb,
         )
 
         for row in forgotten:
@@ -255,7 +262,7 @@ class RulesForRoom(object):
                 user_ids.discard(user_id)
 
         rules_by_user = yield self.store.bulk_get_push_rules(
-            user_ids, on_invalidate=self.invalidate_all,
+            user_ids, on_invalidate=self.invalidate_all_cb,
         )
 
         rules_by_user = {k: v for k, v in rules_by_user.iteritems() if v is not None}
@@ -265,6 +272,7 @@ class RulesForRoom(object):
         defer.returnValue(rules_by_user)
 
     def invalidate_all(self):
+        # XXX: LEAK!!! As things will hold on to a reference to this
         self.sequence += 1
         self.state_group = object()
         self.member_map = {}

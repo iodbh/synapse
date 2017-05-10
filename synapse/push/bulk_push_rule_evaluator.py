@@ -21,36 +21,13 @@ from .push_rule_evaluator import PushRuleEvaluatorForEvent
 
 from synapse.visibility import filter_events_for_clients_context
 from synapse.api.constants import EventTypes, Membership
+from synapse.util.caches.descriptors import cached
 
 
 logger = logging.getLogger(__name__)
 
 
 rules_by_room = {}
-
-
-@defer.inlineCallbacks
-def evaluator_for_event(event, hs, store, context):
-    room_id = event.room_id
-    rules_for_room = rules_by_room.setdefault(room_id, RulesForRoom(hs, room_id))
-
-    rules_by_user = yield rules_for_room.get_rules(context)
-
-    # if this event is an invite event, we may need to run rules for the user
-    # who's been invited, otherwise they won't get told they've been invited
-    if event.type == 'm.room.member' and event.content['membership'] == 'invite':
-        invited_user = event.state_key
-        if invited_user and hs.is_mine_id(invited_user):
-            has_pusher = yield store.user_has_pusher(invited_user)
-            if has_pusher:
-                rules_by_user = dict(rules_by_user)
-                rules_by_user[invited_user] = yield store.get_push_rules_for_user(
-                    invited_user
-                )
-
-    defer.returnValue(BulkPushRuleEvaluator(
-        event.room_id, rules_by_user, store
-    ))
 
 
 class BulkPushRuleEvaluator:
@@ -62,20 +39,45 @@ class BulkPushRuleEvaluator:
     the same logic to run the actual rules, but could be optimised further
     (see https://matrix.org/jira/browse/SYN-562)
     """
-    def __init__(self, room_id, rules_by_user, store):
-        self.room_id = room_id
-        self.rules_by_user = rules_by_user
-        self.store = store
+    def __init__(self, hs):
+        self.hs = hs
+        self.store = hs.get_datastore()
+
+    @cached(max_entries=10000)
+    def _get_rules_for_room(self, room_id):
+        return RulesForRoom(self.hs, room_id)
+
+    @defer.inlineCallbacks
+    def get_rules_for_event(self, event, context):
+        room_id = event.room_id
+        rules_for_room = self._get_rules_for_room(room_id)
+
+        rules_by_user = yield rules_for_room.get_rules(context)
+
+        # if this event is an invite event, we may need to run rules for the user
+        # who's been invited, otherwise they won't get told they've been invited
+        if event.type == 'm.room.member' and event.content['membership'] == 'invite':
+            invited = event.state_key
+            if invited and self.hs.is_mine_id(invited):
+                has_pusher = yield self.store.user_has_pusher(invited)
+                if has_pusher:
+                    rules_by_user = dict(rules_by_user)
+                    rules_by_user[invited] = yield self.store.get_push_rules_for_user(
+                        invited
+                    )
+
+        defer.returnValue(rules_by_user)
 
     @defer.inlineCallbacks
     def action_for_event_by_user(self, event, context):
+        rules_by_user = yield self.get_rules_for_event(event, context)
         actions_by_user = {}
 
         # None of these users can be peeking since this list of users comes
         # from the set of users in the room, so we know for sure they're all
         # actually in the room.
         user_tuples = [
-            (u, False) for u in self.rules_by_user.keys()
+            (u, False) for u in rules_by_user.iterkeys()
         ]
 
         filtered_by_user = yield filter_events_for_clients_context(
@@ -87,13 +89,13 @@ class BulkPushRuleEvaluator:
         )
 
         logger.info("Room members: %d", len(room_members))
-        logger.info("Rules: %r", self.rules_by_user)
+        logger.info("Rules: %r", rules_by_user)
 
         evaluator = PushRuleEvaluatorForEvent(event, len(room_members))
 
         condition_cache = {}
 
-        for uid, rules in self.rules_by_user.items():
+        for uid, rules in rules_by_user.iteritems():
             logger.info("Calculating push for %r, rules: %r", rules)
 
             display_name = None

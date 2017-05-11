@@ -84,9 +84,6 @@ class BulkPushRuleEvaluator:
             event, context
         )
 
-        logger.info("Room members: %d", len(room_members))
-        logger.info("Rules: %r", rules_by_user)
-
         evaluator = PushRuleEvaluatorForEvent(event, len(room_members))
 
         condition_cache = {}

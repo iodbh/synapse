@@ -31,24 +31,16 @@ rules_by_room = {}
 
 
 class BulkPushRuleEvaluator:
+    """Calculates the outcome of push rules for an event for all users in the
+    room at once.
     """
-    Runs push rules for all users in a room.
-    This is faster than running PushRuleEvaluator for each user because it
-    fetches all the rules for all the users in one (batched) db query
-    rather than doing multiple queries per-user. It currently uses
-    the same logic to run the actual rules, but could be optimised further
-    (see https://matrix.org/jira/browse/SYN-562)
-    """
+
     def __init__(self, hs):
         self.hs = hs
         self.store = hs.get_datastore()
 
-    @cached(max_entries=10000)
-    def _get_rules_for_room(self, room_id):
-        return RulesForRoom(self.hs, room_id, self._get_rules_for_room.cache)
-
     @defer.inlineCallbacks
-    def get_rules_for_event(self, event, context):
+    def _get_rules_for_event(self, event, context):
         room_id = event.room_id
         rules_for_room = self._get_rules_for_room(room_id)
 
@@ -68,9 +60,13 @@ class BulkPushRuleEvaluator:
 
         defer.returnValue(rules_by_user)
 
+    @cached(max_entries=10000)
+    def _get_rules_for_room(self, room_id):
+        return RulesForRoom(self.hs, room_id, self._get_rules_for_room.cache)
+
     @defer.inlineCallbacks
     def action_for_event_by_user(self, event, context):
-        rules_by_user = yield self.get_rules_for_event(event, context)
+        rules_by_user = yield self._get_rules_for_event(event, context)
         actions_by_user = {}
 
         # None of these users can be peeking since this list of users comes
@@ -152,19 +148,48 @@ def _condition_checker(evaluator, conditions, uid, display_name, cache):
 
 
 class RulesForRoom(object):
-    def __init__(self, hs, room_id, room_id_to_rules):
+    """Caches push rules for users in a room.
+
+    This efficiently handles users joining/leaving the room by not invalidating
+    the entire cache for the room.
+    """
+
+    def __init__(self, hs, room_id, rules_for_room_cache):
+        """
+        Args:
+            hs (HomeServer)
+            room_id (str)
+            rules_for_room_cache(Cache): The cache object that caches these
+                RoomsForUser objects.
+        """
         self.room_id = room_id
         self.is_mine_id = hs.is_mine_id
         self.store = hs.get_datastore()
 
         self.member_map = {}  # event_id -> (user_id, state)
         self.rules_by_user = {}  # user_id -> rules
+
+        # The last state group we updated the caches for. If the state_group of
+        # a new event comes along, we know that we can just return the cached
+        # result.
+        # On invalidation of the rules themselves (if the user changes them),
+        # we invalidate everything and set state_group to `object()`
         self.state_group = object()
 
+        # A sequence number to keep track of when we're allowed to update the
+        # cache. We bump the sequence number when we invalidate the cache. If
+        # the sequence number changes while we're calculating stuff we should
+        # not update the cache with it.
         self.sequence = 0
 
+        # We need to be clever on the invalidating caches callbacks, as
+        # otherwise the invalidation callback holds a reference to the object,
+        # potentially causing it to leak.
+        # To get around this we pass a function that on invalidations looks ups
+        # the RoomsForUser entry in the cache, rather than keeping a reference
+        # to self around in the callback.
         def invalidate_all_cb():
-            rules = room_id_to_rules.get(room_id)
+            rules = rules_for_room_cache.get(room_id, update_metrics=False)
             if rules:
                 rules.invalidate_all()
 
@@ -172,6 +197,8 @@ class RulesForRoom(object):
 
     @defer.inlineCallbacks
     def get_rules(self, context):
+        # TODO: Remove left users? And don't return them.
+
         state_group = context.state_group
         current_state_ids = context.current_state_ids
 
@@ -203,7 +230,7 @@ class RulesForRoom(object):
             missing_member_event_ids[user_id] = event_id
 
         if missing_member_event_ids:
-            missing_rules = yield self.get_rules_for_member_event_ids(
+            missing_rules = yield self._get_rules_for_member_event_ids(
                 missing_member_event_ids, state_group
             )
             ret_rules_by_user.update(missing_rules)
@@ -211,7 +238,7 @@ class RulesForRoom(object):
         defer.returnValue(ret_rules_by_user)
 
     @defer.inlineCallbacks
-    def get_rules_for_member_event_ids(self, member_event_ids, state_group):
+    def _get_rules_for_member_event_ids(self, member_event_ids, state_group):
         sequence = self.sequence
 
         rows = yield self.store._simple_select_many_batch(
@@ -221,7 +248,7 @@ class RulesForRoom(object):
             retcols=['user_id', 'membership', 'event_id'],
             keyvalues={},
             batch_size=500,
-            desc="get_rules_for_member_event_ids",
+            desc="_get_rules_for_member_event_ids",
         )
 
         members = {
@@ -248,18 +275,6 @@ class RulesForRoom(object):
         for uid in users_with_receipts:
             if uid in interested_in_user_ids:
                 user_ids.add(uid)
-
-        forgotten = yield self.store.who_forgot_in_room(
-            self.room_id, on_invalidate=self.invalidate_all_cb,
-        )
-
-        for row in forgotten:
-            user_id = row["user_id"]
-            event_id = row["event_id"]
-
-            mem_id = member_event_ids.get((user_id), None)
-            if event_id == mem_id:
-                user_ids.discard(user_id)
 
         rules_by_user = yield self.store.bulk_get_push_rules(
             user_ids, on_invalidate=self.invalidate_all_cb,

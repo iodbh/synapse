@@ -89,8 +89,6 @@ class BulkPushRuleEvaluator:
         condition_cache = {}
 
         for uid, rules in rules_by_user.iteritems():
-            logger.info("Calculating push for %r, rules: %r", rules)
-
             display_name = None
             profile_info = room_members.get(uid)
             if profile_info:
@@ -205,6 +203,9 @@ class RulesForRoom(object):
         ret_rules_by_user = {}
         missing_member_event_ids = {}
         for key, event_id in current_state_ids.iteritems():
+            if key[0] != EventTypes.Member:
+                continue
+
             res = self.member_map.get(event_id, None)
             if res:
                 user_id, state = res
@@ -212,9 +213,6 @@ class RulesForRoom(object):
                     rules = self.rules_by_user.get(user_id, None)
                     if rules:
                         ret_rules_by_user[user_id] = rules
-                continue
-
-            if key[0] != EventTypes.Member:
                 continue
 
             user_id = key[1]

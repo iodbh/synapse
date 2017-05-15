@@ -478,17 +478,6 @@ class RoomMemberStore(SQLBaseStore):
 
         defer.returnValue(users_in_room)
 
-    def get_number_of_users_in_rooms(self, room_id):
-        sql = """SELECT coalesce(count(*), 0) FROM current_state_events
-            INNER JOIN room_memberships USING (room_id, event_id)
-            WHERE room_id = ? AND membership = 'join'
-        """
-        return self._execute(
-            "get_number_of_users_in_rooms",
-            lambda txn: txn.fetchone()[0],
-            sql, room_id
-        )
-
     def is_host_joined(self, room_id, host, state_group, state_ids):
         if not state_group:
             # If state_group is None it means it has yet to be assigned a
